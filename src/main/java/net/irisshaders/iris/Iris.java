@@ -34,15 +34,17 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.ConfigScreenHandler;
 import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.fml.IExtensionPoint;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.ModList;
 import net.minecraftforge.fml.ModLoadingContext;
-import net.minecraftforge.fml.common.Mod;
-import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.fml.common.Mod.EventBusSubscriber;
+import net.minecraftforge.fml.common.Mod.EventBusSubscriber.Bus;
+import net.minecraftforge.fml.event.lifecycle.FMLConstructModEvent;
 import net.minecraftforge.fml.loading.FMLEnvironment;
 import net.minecraftforge.fml.loading.FMLPaths;
 import net.minecraftforge.fml.loading.LoadingModList;
@@ -69,10 +71,8 @@ import java.util.stream.Stream;
 import java.util.zip.ZipError;
 import java.util.zip.ZipException;
 
-@Mod(Iris.MODID)
+@EventBusSubscriber(bus = Bus.MOD, modid = Oculus.MODID, value = Dist.CLIENT)
 public class Iris {
-	public static final String MODID = "oculus";
-
 	/**
 	 * The user-facing name of the mod. Moved into a constant to facilitate
 	 * easy branding changes (for forks). You'll still need to change this
@@ -109,17 +109,11 @@ public class Iris {
 	private static boolean loadPackWhenPossible = false;
 	private static boolean renderSystemInit = false;
 
-	public Iris() {
-		try {
-			FMLJavaModLoadingContext.get().getModEventBus().addListener(this::onKeyRegister);
-			MinecraftForge.EVENT_BUS.addListener(this::onKeyInput);
-
-			IRIS_VERSION = ModList.get().getModContainerById(MODID).get().getModInfo().getVersion().toString();
-
-			ModLoadingContext.get().registerExtensionPoint(ConfigScreenHandler.ConfigScreenFactory.class, () -> new ConfigScreenHandler.ConfigScreenFactory((mc, screen) -> new ShaderPackScreen(screen)));
-			ModLoadingContext.get().registerExtensionPoint(IExtensionPoint.DisplayTest.class, () -> new IExtensionPoint.DisplayTest(() -> NetworkConstants.IGNORESERVERONLY, (a, b) -> true));
-		}catch (Exception ignored) {
-		}
+	@SubscribeEvent
+	public static void onInitializeClient(FMLConstructModEvent event) {
+		IRIS_VERSION = ModList.get().getModContainerById(Oculus.MODID).get().getModInfo().getVersion().toString();
+		ModLoadingContext.get().registerExtensionPoint(ConfigScreenHandler.ConfigScreenFactory.class, () -> new ConfigScreenHandler.ConfigScreenFactory((mc, screen) -> new ShaderPackScreen(screen)));
+		MinecraftForge.EVENT_BUS.addListener(Iris::onKeyInput);
 	}
 
 	public static void loadShaderpackWhenPossible() {
@@ -130,13 +124,14 @@ public class Iris {
 		return pipelineManager.getPipelineNullable() instanceof IrisRenderingPipeline;
 	}
 
-	public void onKeyRegister(RegisterKeyMappingsEvent event) {
+	@SubscribeEvent
+	public static void onKeyRegister(RegisterKeyMappingsEvent event) {
 		event.register(reloadKeybind);
 		event.register(toggleShadersKeybind);
 		event.register(shaderpackScreenKeybind);
 	}
 
-	public void onKeyInput(InputEvent.Key event) {
+	public static void onKeyInput(InputEvent.Key event) {
 		handleKeybinds(Minecraft.getInstance());
 	}
 
@@ -771,7 +766,7 @@ public class Iris {
 			logger.warn("", e);
 		}
 
-		irisConfig = new IrisConfig(FMLPaths.CONFIGDIR.get().resolve(MODID + ".properties"));
+		irisConfig = new IrisConfig(FMLPaths.CONFIGDIR.get().resolve(Oculus.MODID + ".properties"));
 
 		try {
 			irisConfig.initialize();
