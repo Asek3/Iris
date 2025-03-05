@@ -260,7 +260,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			forcedShadowRenderDistanceChunks = OptionalInt.empty();
 		}
 
-		this.customUniforms = programSet.getPack().customUniforms.build(
+		this.customUniforms = programSet.getPack().getCustomUniforms().build(
 			holder -> CommonUniforms.addNonDynamicUniforms(holder, programSet.getPack().getIdMap(), programSet.getPackDirectives(), this.updateNotifier)
 		);
 
