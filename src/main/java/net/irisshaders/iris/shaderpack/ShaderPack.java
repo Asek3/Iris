@@ -1,15 +1,10 @@
 package net.irisshaders.iris.shaderpack;
 
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
+import com.google.common.cache.*;
 import com.google.common.collect.ImmutableList;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
-import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
-import net.irisshaders.iris.Iris;
+import it.unimi.dsi.fastutil.objects.*;
 import net.irisshaders.iris.api.v0.IrisApi;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.texture.TextureDefinition;
@@ -52,9 +47,8 @@ public class ShaderPack {
 	private static final ExecutorService ASYNC_TEXTURE_EXECUTOR = Executors.newWorkStealingPool(
 			Runtime.getRuntime().availableProcessors()
 	);
-	private static final Map<String, Integer> SHADER_BINARY_CACHE = new ConcurrentHashMap<>();
 
-	static {
+    static {
 		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 			ASYNC_TEXTURE_EXECUTOR.shutdown();
 			try {
@@ -331,22 +325,17 @@ public class ShaderPack {
 				if (definition instanceof TextureDefinition.PNGDefinition) {
 					return new CustomTextureData.PngData(filtering, data);
 				} else if (definition instanceof TextureDefinition.RawDefinition raw) {
-					switch (raw.getTarget()) {
-						case TEXTURE_1D:
-							return new CustomTextureData.RawData1D(data, filtering,
-									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX());
-						case TEXTURE_2D:
-							return new CustomTextureData.RawData2D(data, filtering,
-									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
-						case TEXTURE_3D:
-							return new CustomTextureData.RawData3D(data, filtering,
-									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY(), raw.getSizeZ());
-						case TEXTURE_RECTANGLE:
-							return new CustomTextureData.RawDataRect(data, filtering,
-									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
-						default:
-							throw new IllegalArgumentException("Unsupported texture target: " + raw.getTarget());
-					}
+                    return switch (raw.getTarget()) {
+                        case TEXTURE_1D -> new CustomTextureData.RawData1D(data, filtering,
+                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX());
+                        case TEXTURE_2D -> new CustomTextureData.RawData2D(data, filtering,
+                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
+                        case TEXTURE_3D -> new CustomTextureData.RawData3D(data, filtering,
+                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY(), raw.getSizeZ());
+                        case TEXTURE_RECTANGLE -> new CustomTextureData.RawDataRect(data, filtering,
+                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
+                        default -> throw new IllegalArgumentException("Unsupported texture target: " + raw.getTarget());
+                    };
 				}
 				throw new IOException("Unsupported texture definition type: " + definition.getClass().getSimpleName());
 			} catch (Exception e) {
