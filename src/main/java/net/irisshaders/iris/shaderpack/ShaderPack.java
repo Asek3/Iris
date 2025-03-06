@@ -6,7 +6,6 @@ import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableList;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParseException;
 import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
@@ -18,31 +17,22 @@ import net.irisshaders.iris.gui.FeatureMissingErrorScreen;
 import net.irisshaders.iris.gui.screen.ShaderPackScreen;
 import net.irisshaders.iris.helpers.StringPair;
 import net.irisshaders.iris.pathways.colorspace.ColorSpace;
-import net.irisshaders.iris.shaderpack.include.AbsolutePackPath;
-import net.irisshaders.iris.shaderpack.include.IncludeGraph;
-import net.irisshaders.iris.shaderpack.include.IncludeProcessor;
-import net.irisshaders.iris.shaderpack.include.ShaderPackSourceNames;
+import net.irisshaders.iris.shaderpack.include.*;
 import net.irisshaders.iris.shaderpack.materialmap.NamespacedId;
-import net.irisshaders.iris.shaderpack.option.OrderBackedProperties;
-import net.irisshaders.iris.shaderpack.option.ProfileSet;
-import net.irisshaders.iris.shaderpack.option.ShaderPackOptions;
+import net.irisshaders.iris.shaderpack.option.*;
 import net.irisshaders.iris.shaderpack.option.menu.OptionMenuContainer;
-import net.irisshaders.iris.shaderpack.option.values.MutableOptionValues;
-import net.irisshaders.iris.shaderpack.option.values.OptionValues;
+import net.irisshaders.iris.shaderpack.option.values.*;
 import net.irisshaders.iris.shaderpack.parsing.BooleanParser;
-import net.irisshaders.iris.shaderpack.preprocessor.JcppProcessor;
-import net.irisshaders.iris.shaderpack.preprocessor.PropertiesPreprocessor;
-import net.irisshaders.iris.shaderpack.programs.ProgramSet;
-import net.irisshaders.iris.shaderpack.programs.ProgramSetInterface;
+import net.irisshaders.iris.shaderpack.preprocessor.*;
+import net.irisshaders.iris.shaderpack.programs.*;
 import net.irisshaders.iris.shaderpack.properties.ShaderProperties;
-import net.irisshaders.iris.shaderpack.texture.CustomTextureData;
-import net.irisshaders.iris.shaderpack.texture.TextureFilteringData;
-import net.irisshaders.iris.shaderpack.texture.TextureStage;
+import net.irisshaders.iris.shaderpack.texture.*;
 import net.irisshaders.iris.uniforms.custom.CustomUniforms;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import org.apache.commons.lang3.SystemUtils;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,9 +40,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Function;
@@ -79,8 +67,8 @@ public class ShaderPack {
 		}));
 	}
 
-	private final CustomUniforms.Builder customUniforms;
-	private final TextureLoader textureLoader = new TextureLoader();
+	private final Map<TextureDefinition, CompletableFuture<CustomTextureData>> textureCache = new ConcurrentHashMap<>();
+	public final CustomUniforms.Builder customUniforms;
 	private final ProgramSet base;
 	private final Map<NamespacedId, ProgramSetInterface> overrides;
 	private final IdMap idMap;
@@ -115,10 +103,10 @@ public class ShaderPack {
 		final boolean[] hasDimensionIds = {false};
 
 		// Dimension properties loading
-		List<String> dimensionIdCreator = loadProperties(root, "dimension.properties", environmentDefines).map(dimensionProperties -> {
+		List<String> dimensionIdCreator = loadProperties(root, environmentDefines).map(dimensionProperties -> {
 			hasDimensionIds[0] = !dimensionProperties.isEmpty();
-			dimensionMap = parseDimensionMap(dimensionProperties, "dimension.", "dimension.properties");
-			return parseDimensionIds(dimensionProperties, "dimension.");
+			dimensionMap = parseDimensionMap(dimensionProperties);
+			return parseDimensionIds(dimensionProperties);
 		}).orElse(new ArrayList<>());
 
 		if (!hasDimensionIds[0]) {
@@ -268,7 +256,7 @@ public class ShaderPack {
 
 		customNoiseTexture = shaderProperties.getNoiseTexturePath().map(path -> {
 			try {
-				return textureLoader.readTexture(root, new TextureDefinition.PNGDefinition(path));
+				return readTexture(root, new TextureDefinition.PNGDefinition(path));
 			} catch (IOException e) {
 				LOGGER.error("Failed to load noise texture: {}", path, e);
 				return null;
@@ -279,7 +267,7 @@ public class ShaderPack {
 			Object2ObjectMap<String, CustomTextureData> innerMap = new Object2ObjectOpenHashMap<>();
 			customTexturePropertiesMap.forEach((samplerName, definition) -> {
 				try {
-					innerMap.put(samplerName, textureLoader.readTexture(root, definition));
+					innerMap.put(samplerName, readTexture(root, definition));
 				} catch (IOException e) {
 					LOGGER.error("Failed to load custom texture {}: {}", samplerName, definition.getName(), e);
 				}
@@ -292,11 +280,116 @@ public class ShaderPack {
 
 		shaderProperties.getIrisCustomTextures().forEach((name, texture) -> {
 			try {
-				irisCustomTextureDataMap.put(name, textureLoader.readTexture(root, texture));
+				irisCustomTextureDataMap.put(name, readTexture(root, texture));
 			} catch (IOException e) {
 				LOGGER.error("Failed to load Iris custom texture {}: {}", name, texture.getName(), e);
 			}
 		});
+	}
+
+	private CustomTextureData readTexture(Path root, TextureDefinition definition) throws IOException {
+		try {
+			return textureCache.computeIfAbsent(definition,
+					def -> loadTextureAsync(root, def)
+							.exceptionally(e -> createFallbackTexture(def))
+			).get(2000, TimeUnit.MILLISECONDS);
+		} catch (TimeoutException e) {
+			LOGGER.warn("Texture load timeout: {}", definition.getName());
+			return createPlaceholderTexture();
+		} catch (Exception e) {
+			throw new IOException(e);
+		}
+	}
+
+	private CompletableFuture<CustomTextureData> loadTextureAsync(Path root, TextureDefinition definition) {
+		return CompletableFuture.supplyAsync(() -> {
+			try {
+				String path = definition.getName();
+				if (path.contains(":")) {
+					String[] parts = path.split(":");
+					if (parts.length > 2) {
+						LOGGER.warn("Invalid resource location: {}", path);
+					}
+					if (parts[0].equals("minecraft") && (parts[1].equals("dynamic/lightmap_1") || parts[1].equals("dynamic/light_map_1"))) {
+						return new CustomTextureData.LightmapMarker();
+					}
+					return new CustomTextureData.ResourceData(parts[0], parts[1]);
+				}
+
+				if (path.startsWith("/")) {
+					path = path.substring(1);
+				}
+				Path resolvedPath = root.resolve(path);
+				if (!Files.exists(resolvedPath)) {
+					LOGGER.error("Texture file not found: {}", path);
+					throw new IOException("Texture file not found: " + path);
+				}
+
+				TextureFilteringData filtering = resolveFilteringData(root, path, definition);
+				byte[] data = Files.readAllBytes(resolvedPath);
+
+				if (definition instanceof TextureDefinition.PNGDefinition) {
+					return new CustomTextureData.PngData(filtering, data);
+				} else if (definition instanceof TextureDefinition.RawDefinition raw) {
+					switch (raw.getTarget()) {
+						case TEXTURE_1D:
+							return new CustomTextureData.RawData1D(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX());
+						case TEXTURE_2D:
+							return new CustomTextureData.RawData2D(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
+						case TEXTURE_3D:
+							return new CustomTextureData.RawData3D(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY(), raw.getSizeZ());
+						case TEXTURE_RECTANGLE:
+							return new CustomTextureData.RawDataRect(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
+						default:
+							throw new IllegalArgumentException("Unsupported texture target: " + raw.getTarget());
+					}
+				}
+				throw new IOException("Unsupported texture definition type: " + definition.getClass().getSimpleName());
+			} catch (Exception e) {
+				throw new CompletionException(e);
+			}
+		}, ASYNC_TEXTURE_EXECUTOR);
+	}
+
+	private boolean isSkyTexture(TextureDefinition definition) {
+		// 假设天空纹理的名称包含 "sky" 或 "cloud"
+		return definition.getName().contains("sky") || definition.getName().contains("cloud");
+	}
+
+	private TextureFilteringData resolveFilteringData(Path root, String path, TextureDefinition definition) {
+		boolean blur = definition instanceof TextureDefinition.RawDefinition || isSkyTexture(definition);
+		boolean clamp = definition instanceof TextureDefinition.RawDefinition || isSkyTexture(definition);
+		Path mcMetaPath = root.resolve(path + ".mcmeta");
+
+		if (Files.exists(mcMetaPath)) {
+			try (BufferedReader reader = Files.newBufferedReader(mcMetaPath, StandardCharsets.UTF_8)) {
+				JsonObject meta = GSON.fromJson(reader, JsonObject.class);
+				if (meta.has("texture")) {
+					JsonObject textureMeta = meta.getAsJsonObject("texture");
+					if (textureMeta.has("blur")) blur = textureMeta.get("blur").getAsBoolean();
+					if (textureMeta.has("clamp")) clamp = textureMeta.get("clamp").getAsBoolean();
+				}
+			} catch (Exception e) {
+				LOGGER.error("Failed to load texture filtering data: {}", path, e);
+			}
+		}
+		return new TextureFilteringData(blur, clamp);
+	}
+
+	private CustomTextureData createPlaceholderTexture() {
+		return new CustomTextureData.PngData(
+				new TextureFilteringData(false, false),
+				new byte[0]
+		);
+	}
+
+	private CustomTextureData createFallbackTexture(TextureDefinition definition) {
+		LOGGER.warn("Failed to load texture: {}", definition.getName());
+		return createPlaceholderTexture();
 	}
 
 	private static Optional<String> loadPropertiesAsString(Path shaderPath, String name, Iterable<StringPair> environmentDefines) {
@@ -315,8 +408,8 @@ public class ShaderPack {
 		}
 	}
 
-	private static Optional<Properties> loadProperties(Path shaderPath, String name, Iterable<StringPair> environmentDefines) {
-		return loadPropertiesAsString(shaderPath, name, environmentDefines).map(processed -> {
+	private static Optional<Properties> loadProperties(Path shaderPath, Iterable<StringPair> environmentDefines) {
+		return loadPropertiesAsString(shaderPath, "dimension.properties", environmentDefines).map(processed -> {
 			Properties properties = new OrderBackedProperties();
 			try {
 				properties.load(new StringReader(processed));
@@ -327,11 +420,11 @@ public class ShaderPack {
 		});
 	}
 
-	private static Map<NamespacedId, String> parseDimensionMap(Properties properties, String keyPrefix, String fileName) {
+	private static Map<NamespacedId, String> parseDimensionMap(Properties properties) {
 		return properties.entrySet().stream()
-				.filter(entry -> ((String) entry.getKey()).startsWith(keyPrefix))
+				.filter(entry -> ((String) entry.getKey()).startsWith("dimension."))
 				.flatMap(entry -> {
-					String key = ((String) entry.getKey()).substring(keyPrefix.length());
+					String key = ((String) entry.getKey()).substring("dimension.".length());
 					String value = (String) entry.getValue();
 					return Arrays.stream(value.split("\\s+"))
 							.map(part -> part.equals("*")
@@ -341,11 +434,11 @@ public class ShaderPack {
 				.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 	}
 
-	private List<String> parseDimensionIds(Properties dimensionProperties, String keyPrefix) {
+	private List<String> parseDimensionIds(Properties dimensionProperties) {
 		return dimensionProperties.keySet().stream()
 				.map(keyObj -> (String) keyObj)
-				.filter(key -> key.startsWith(keyPrefix))
-				.map(key -> key.substring(keyPrefix.length()))
+				.filter(key -> key.startsWith("dimension."))
+				.map(key -> key.substring("dimension.".length()))
 				.collect(Collectors.toList());
 	}
 
@@ -371,88 +464,6 @@ public class ShaderPack {
 			return ProgramSetInterface.Empty.INSTANCE;
 		});
 		return (override instanceof ProgramSet) ? (ProgramSet) override : base;
-	}
-
-
-	// Helper classes and remaining methods
-	private static final class PreprocessKey {
-		private final String content;
-		private final ImmutableList<StringPair> defines;
-
-		PreprocessKey(String content, ImmutableList<StringPair> defines) {
-			this.content = content.intern();
-			this.defines = defines;
-		}
-
-		@Override
-		public boolean equals(Object o) {
-			if (this == o) return true;
-			if (!(o instanceof PreprocessKey)) return false;
-			PreprocessKey that = (PreprocessKey) o;
-			return content.equals(that.content) && defines.equals(that.defines);
-		}
-
-		@Override
-		public int hashCode() {
-			return Objects.hash(content, defines);
-		}
-	}
-
-	private static final LoadingCache<PreprocessKey, String> PREPROCESS_CACHE = CacheBuilder.newBuilder()
-			.maximumSize(1000)
-			.build(new CacheLoader<PreprocessKey, String>() {
-				public String load(PreprocessKey key) {
-					return PropertiesPreprocessor.preprocessSource(key.content, key.defines);
-				}
-			});
-
-	// TextureLoader inner class
-	private static class TextureLoader {
-		private final Map<TextureDefinition, CompletableFuture<CustomTextureData>> textureCache = new ConcurrentHashMap<>();
-
-		public CustomTextureData readTexture(Path root, TextureDefinition definition) throws IOException {
-			try {
-				return textureCache.computeIfAbsent(definition,
-						def -> loadTextureAsync(root, def)
-				).get(500, TimeUnit.MILLISECONDS);
-			} catch (TimeoutException e) {
-				return createPlaceholderTexture();
-			} catch (Exception e) {
-				throw new IOException("Texture loading failed: " + definition.getName(), e);
-			}
-		}
-
-		private CompletableFuture<CustomTextureData> loadTextureAsync(Path root, TextureDefinition definition) {
-			return CompletableFuture.supplyAsync(() -> {
-				try {
-					Path texturePath = root.resolve(definition.getName());
-					if (!Files.exists(texturePath)) {
-						LOGGER.warn("Missing texture: {}", definition.getName());
-						return createPlaceholderTexture();
-					}
-
-					byte[] data = Files.readAllBytes(texturePath);
-					return new CustomTextureData.PngData(
-							new TextureFilteringData(false, false),
-							data
-					);
-				} catch (Exception e) {
-					LOGGER.error("Failed to load texture", e);
-					return createPlaceholderTexture();
-				}
-			}, ASYNC_TEXTURE_EXECUTOR);
-		}
-
-		private CustomTextureData createPlaceholderTexture() {
-			return new CustomTextureData.PngData(
-					new TextureFilteringData(false, false),
-					new byte[0]
-			);
-		}
-	}
-
-	public CustomUniforms.Builder getCustomUniforms() {
-		return this.customUniforms;
 	}
 
 	public IdMap getIdMap() {
@@ -490,4 +501,31 @@ public class ShaderPack {
 	public boolean hasFeature(FeatureFlags feature) {
 		return activeFeatures.contains(feature);
 	}
+
+	private record PreprocessKey(String content, ImmutableList<StringPair> defines) {
+		private PreprocessKey(String content, ImmutableList<StringPair> defines) {
+			this.content = content.intern();
+			this.defines = defines;
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) return true;
+			if (!(o instanceof PreprocessKey that)) return false;
+			return content.equals(that.content) && defines.equals(that.defines);
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(content, defines);
+		}
+	}
+
+	private static final LoadingCache<PreprocessKey, String> PREPROCESS_CACHE = CacheBuilder.newBuilder()
+			.maximumSize(1000)
+			.build(new CacheLoader<PreprocessKey, String>() {
+				public @NotNull String load(@NotNull PreprocessKey key) {
+					return PropertiesPreprocessor.preprocessSource(key.content, key.defines);
+				}
+			});
 }
