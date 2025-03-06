@@ -17,6 +17,7 @@
     "MixinTheEndPortalRenderer",
     "MixinEntityRenderDispatcher",
     "MixinFogRenderer",
+    "MixinForgeTranslucentShader",
     "MixinGameRenderer",
     "MixinGameRenderer_NightVisionCompat",
     "MixinProgram",
