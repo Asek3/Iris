@@ -7,6 +7,7 @@ import net.irisshaders.iris.parsing.BiomeCategories;
 import net.irisshaders.iris.uniforms.BiomeUniforms;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
