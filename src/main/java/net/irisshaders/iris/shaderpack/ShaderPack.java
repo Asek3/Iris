@@ -44,24 +44,14 @@ import java.util.stream.Collectors;
 public class ShaderPack {
 	private static final Logger LOGGER = LoggerFactory.getLogger(ShaderPack.class);
 	private static final Gson GSON = new Gson();
-	private static final ExecutorService ASYNC_TEXTURE_EXECUTOR = Executors.newWorkStealingPool(
-			Runtime.getRuntime().availableProcessors()
-	);
 
-    static {
-		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-			ASYNC_TEXTURE_EXECUTOR.shutdown();
-			try {
-				if (!ASYNC_TEXTURE_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS)) {
-					ASYNC_TEXTURE_EXECUTOR.shutdownNow();
-				}
-			} catch (InterruptedException e) {
-				ASYNC_TEXTURE_EXECUTOR.shutdownNow();
-			}
-		}));
-	}
+	private static final ExecutorService ASYNC_TEXTURE_EXECUTOR = Executors.newWorkStealingPool();
+	static int cpuCores = Runtime.getRuntime().availableProcessors();
+	static int poolSize = Math.min(32, (int)(cpuCores * (1 + 2 * 0.8)));
+	static ExecutorService executor = Executors.newWorkStealingPool(poolSize);
 
 	private final Map<TextureDefinition, CompletableFuture<CustomTextureData>> textureCache = new ConcurrentHashMap<>();
+
 	public final CustomUniforms.Builder customUniforms;
 	private final ProgramSet base;
 	private final Map<NamespacedId, ProgramSetInterface> overrides;
@@ -81,9 +71,27 @@ public class ShaderPack {
 	private final List<String> dimensionIds;
 	private Map<NamespacedId, String> dimensionMap;
 
-	public ShaderPack(Path root, ImmutableList<StringPair> environmentDefines) throws IOException, IllegalStateException {
-		this(root, Collections.emptyMap(), environmentDefines);
+	static {
+		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+			ASYNC_TEXTURE_EXECUTOR.shutdown();
+			executor.shutdown();
+			try {
+				if (!ASYNC_TEXTURE_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS)) {
+					ASYNC_TEXTURE_EXECUTOR.shutdownNow();
+				}
+				if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+					executor.shutdownNow();
+				}
+			} catch (InterruptedException e) {
+				ASYNC_TEXTURE_EXECUTOR.shutdownNow();
+				executor.shutdownNow();
+			}
+		}));
 	}
+
+	private int size;
+	private int i;
+	private int i1;
 
 	public ShaderPack(Path root, Map<String, String> changedConfigs, ImmutableList<StringPair> environmentDefines) throws IOException, IllegalStateException {
 		Objects.requireNonNull(root);
@@ -248,12 +256,13 @@ public class ShaderPack {
 		this.overrides = new HashMap<>();
 		this.idMap = new IdMap(root, shaderPackOptions, environmentDefines);
 
+		// 优化：异步加载噪声纹理
 		customNoiseTexture = shaderProperties.getNoiseTexturePath().map(path -> {
 			try {
 				return readTexture(root, new TextureDefinition.PNGDefinition(path));
 			} catch (IOException e) {
 				LOGGER.error("Failed to load noise texture: {}", path, e);
-				return null;
+				return createFallbackTexture(new TextureDefinition.PNGDefinition(path));
 			}
 		}).orElse(null);
 
@@ -264,6 +273,7 @@ public class ShaderPack {
 					innerMap.put(samplerName, readTexture(root, definition));
 				} catch (IOException e) {
 					LOGGER.error("Failed to load custom texture {}: {}", samplerName, definition.getName(), e);
+					innerMap.put(samplerName, createFallbackTexture(definition));
 				}
 			});
 			customTextureDataMap.put(textureStage, innerMap);
@@ -277,76 +287,82 @@ public class ShaderPack {
 				irisCustomTextureDataMap.put(name, readTexture(root, texture));
 			} catch (IOException e) {
 				LOGGER.error("Failed to load Iris custom texture {}: {}", name, texture.getName(), e);
+				irisCustomTextureDataMap.put(name, createFallbackTexture(texture));
 			}
 		});
 	}
-
 	private CustomTextureData readTexture(Path root, TextureDefinition definition) throws IOException {
+		CompletableFuture<CustomTextureData> future = textureCache.computeIfAbsent(definition,
+				def -> loadTextureAsync(root, def)
+						.exceptionally(e -> createFallbackTexture(def))
+		);
+
 		try {
-			return textureCache.computeIfAbsent(definition,
-					def -> loadTextureAsync(root, def)
-							.exceptionally(e -> createFallbackTexture(def))
-			).get(2000, TimeUnit.MILLISECONDS);
+			return future.get(2000, TimeUnit.MILLISECONDS);
 		} catch (TimeoutException e) {
 			LOGGER.warn("Texture load timeout: {}", definition.getName());
-			return createPlaceholderTexture();
-		} catch (Exception e) {
+			int size = 64;
+			return createPlaceholderTexture(size);
+		} catch (InterruptedException | ExecutionException e) {
 			throw new IOException(e);
 		}
 	}
 
+	private final Semaphore textureLoadSemaphore = new Semaphore(10);
+
 	private CompletableFuture<CustomTextureData> loadTextureAsync(Path root, TextureDefinition definition) {
 		return CompletableFuture.supplyAsync(() -> {
 			try {
-				String path = definition.getName();
-				if (path.contains(":")) {
-					String[] parts = path.split(":");
-					if (parts.length > 2) {
-						LOGGER.warn("Invalid resource location: {}", path);
+				textureLoadSemaphore.acquire();
+				try {
+					String path = definition.getName();
+					if (path.contains(":")) {
+						String[] parts = path.split(":");
+						if (parts.length > 2) {
+							LOGGER.warn("Invalid resource location: {}", path);
+						}
+						if (parts[0].equals("minecraft") && (parts[1].equals("dynamic/lightmap_1") || parts[1].equals("dynamic/light_map_1"))) {
+							return new CustomTextureData.LightmapMarker();
+						}
+						return new CustomTextureData.ResourceData(parts[0], parts[1]);
 					}
-					if (parts[0].equals("minecraft") && (parts[1].equals("dynamic/lightmap_1") || parts[1].equals("dynamic/light_map_1"))) {
-						return new CustomTextureData.LightmapMarker();
+
+					if (path.startsWith("/")) {
+						path = path.substring(1);
 					}
-					return new CustomTextureData.ResourceData(parts[0], parts[1]);
-				}
+					Path resolvedPath = root.resolve(path);
+					if (!Files.exists(resolvedPath)) {
+						LOGGER.error("Texture file not found: {}", path);
+						throw new IOException("Texture file not found: " + path);
+					}
 
-				if (path.startsWith("/")) {
-					path = path.substring(1);
-				}
-				Path resolvedPath = root.resolve(path);
-				if (!Files.exists(resolvedPath)) {
-					LOGGER.error("Texture file not found: {}", path);
-					throw new IOException("Texture file not found: " + path);
-				}
+					TextureFilteringData filtering = resolveFilteringData(root, path, definition);
+					byte[] data = Files.readAllBytes(resolvedPath);
 
-				TextureFilteringData filtering = resolveFilteringData(root, path, definition);
-				byte[] data = Files.readAllBytes(resolvedPath);
-
-				if (definition instanceof TextureDefinition.PNGDefinition) {
-					return new CustomTextureData.PngData(filtering, data);
-				} else if (definition instanceof TextureDefinition.RawDefinition raw) {
-                    return switch (raw.getTarget()) {
-                        case TEXTURE_1D -> new CustomTextureData.RawData1D(data, filtering,
-                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX());
-                        case TEXTURE_2D -> new CustomTextureData.RawData2D(data, filtering,
-                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
-                        case TEXTURE_3D -> new CustomTextureData.RawData3D(data, filtering,
-                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY(), raw.getSizeZ());
-                        case TEXTURE_RECTANGLE -> new CustomTextureData.RawDataRect(data, filtering,
-                                raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
-                        default -> throw new IllegalArgumentException("Unsupported texture target: " + raw.getTarget());
-                    };
+					if (definition instanceof TextureDefinition.PNGDefinition) {
+						return new CustomTextureData.PngData(filtering, data);
+					} else if (definition instanceof TextureDefinition.RawDefinition raw) {
+						return switch (raw.getTarget()) {
+							case TEXTURE_1D -> new CustomTextureData.RawData1D(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX());
+							case TEXTURE_2D -> new CustomTextureData.RawData2D(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
+							case TEXTURE_3D -> new CustomTextureData.RawData3D(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY(), raw.getSizeZ());
+							case TEXTURE_RECTANGLE -> new CustomTextureData.RawDataRect(data, filtering,
+									raw.getInternalFormat(), raw.getFormat(), raw.getPixelType(), raw.getSizeX(), raw.getSizeY());
+							default -> throw new IllegalArgumentException("Unsupported texture target: " + raw.getTarget());
+						};
+					}
+					throw new IOException("Unsupported texture definition type: " + definition.getClass().getSimpleName());
+				} finally {
+					textureLoadSemaphore.release();
 				}
-				throw new IOException("Unsupported texture definition type: " + definition.getClass().getSimpleName());
-			} catch (Exception e) {
+			} catch (InterruptedException | IOException e) {
+				Thread.currentThread().interrupt();
 				throw new CompletionException(e);
 			}
 		}, ASYNC_TEXTURE_EXECUTOR);
-	}
-
-	private boolean isSkyTexture(TextureDefinition definition) {
-		// 假设天空纹理的名称包含 "sky" 或 "cloud"
-		return definition.getName().contains("sky") || definition.getName().contains("cloud");
 	}
 
 	private TextureFilteringData resolveFilteringData(Path root, String path, TextureDefinition definition) {
@@ -369,7 +385,14 @@ public class ShaderPack {
 		return new TextureFilteringData(blur, clamp);
 	}
 
-	private CustomTextureData createPlaceholderTexture() {
+	private boolean isSkyTexture(TextureDefinition definition) {
+		return definition.getName().contains("sky") || definition.getName().contains("cloud");
+	}
+
+	private CustomTextureData createPlaceholderTexture(int size) {
+		this.size = size;
+		this.i = -10066330;
+		this.i1 = -6710887;
 		return new CustomTextureData.PngData(
 				new TextureFilteringData(false, false),
 				new byte[0]
@@ -377,9 +400,14 @@ public class ShaderPack {
 	}
 
 	private CustomTextureData createFallbackTexture(TextureDefinition definition) {
-		LOGGER.warn("Failed to load texture: {}", definition.getName());
-		return createPlaceholderTexture();
+		int size = 64;
+		if (definition instanceof TextureDefinition.RawDefinition) {
+			size = Math.max(((TextureDefinition.RawDefinition) definition).getSizeX(), 16);
+		}
+		LOGGER.warn("Using fallback texture for: {}", definition.getName());
+		return createPlaceholderTexture(size);
 	}
+
 
 	private static Optional<String> loadPropertiesAsString(Path shaderPath, String name, Iterable<StringPair> environmentDefines) {
 		try {
@@ -491,6 +519,18 @@ public class ShaderPack {
 		return activeFeatures.contains(feature);
 	}
 
+	public int getSize() {
+		return size;
+	}
+
+	public int getI() {
+		return i;
+	}
+
+	public int getI1() {
+		return i1;
+	}
+
 	private record PreprocessKey(String content, ImmutableList<StringPair> defines) {
 		private PreprocessKey(String content, ImmutableList<StringPair> defines) {
 			this.content = content.intern();
@@ -517,4 +557,5 @@ public class ShaderPack {
 					return PropertiesPreprocessor.preprocessSource(key.content, key.defines);
 				}
 			});
+
 }
